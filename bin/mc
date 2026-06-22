@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${MIHOMO_CONFIG_FILE:-/etc/mihomo/config.yaml}"
+DEFAULT_CTRL="http://127.0.0.1:9090"
+
+read_config_value() {
+  local key="$1"
+  if [ -f "$CONFIG_FILE" ]; then
+    grep -E "^[[:space:]]*${key}:" "$CONFIG_FILE" | head -n 1 | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//; s/[\"']//g; s/[[:space:]]+$//"
+  fi
+}
+
+normalize_ctrl() {
+  local raw="$1"
+  if [ -z "$raw" ]; then
+    echo "$DEFAULT_CTRL"
+  elif [[ "$raw" == http://* || "$raw" == https://* ]]; then
+    echo "$raw"
+  else
+    echo "http://$raw"
+  fi
+}
+
+CTRL="${MIHOMO_CTRL:-$(normalize_ctrl "$(read_config_value external-controller || true)")}"
+SECRET="${MIHOMO_SECRET:-$(read_config_value secret || true)}"
+TMP_JSON="/tmp/mihomo-proxies.json"
+
+api_get() {
+  local url="$1"
+  if [ -n "${SECRET:-}" ]; then
+    curl -sS -H "Authorization: Bearer $SECRET" "$url"
+  else
+    curl -sS "$url"
+  fi
+}
+
+api_put_json() {
+  local url="$1"
+  local body="$2"
+  if [ -n "${SECRET:-}" ]; then
+    curl -sS -X PUT \
+      -H "Authorization: Bearer $SECRET" \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      "$url"
+  else
+    curl -sS -X PUT \
+      -H "Content-Type: application/json" \
+      --data "$body" \
+      "$url"
+  fi
+}
+
+urlencode_env() {
+  local var="$1"
+  python3 - <<PY
+import os, urllib.parse
+print(urllib.parse.quote(os.environ["$var"], safe=""))
+PY
+}
+
+json_body_for_node() {
+  NODE_FOR_JSON="$1" python3 - <<'PY'
+import os, json
+print(json.dumps({"name": os.environ["NODE_FOR_JSON"]}, ensure_ascii=False))
+PY
+}
+
+fetch_proxies() {
+  api_get "$CTRL/proxies" > "$TMP_JSON"
+  python3 - <<'PY'
+import json, sys
+path='/tmp/mihomo-proxies.json'
+try:
+    data=json.load(open(path))
+except Exception as e:
+    print(f"无法解析 mihomo API 返回：{e}", file=sys.stderr)
+    sys.exit(1)
+if 'proxies' not in data:
+    print("mihomo API 返回中没有 proxies 字段。可能是 secret 错误、API 未启动，或返回了错误信息：", file=sys.stderr)
+    print(data, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+usage() {
+  cat <<'USAGE'
+用法：
+  mc version                         查看 mihomo 版本
+  mc groups                          查看代理组
+  mc current                         查看当前 Selector 选择
+  mc nodes '<代理组名>'              查看某个代理组的所有节点
+  mc switch '<代理组名>' '<节点名>'   切换节点
+  mc delay '<节点名>' [timeout_ms]    测试节点延迟，默认 5000ms
+  mc test [proxy_url]                测试代理出口，默认 http://127.0.0.1:7890
+  mc reload                          重新加载配置
+  mc raw                             输出 /proxies 原始 JSON
+  mc help                            显示帮助
+
+环境变量：
+  MIHOMO_CTRL=http://127.0.0.1:9090
+  MIHOMO_SECRET=你的secret
+  MIHOMO_CONFIG_FILE=/etc/mihomo/config.yaml
+USAGE
+}
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  version)
+    api_get "$CTRL/version"
+    echo
+    ;;
+
+  raw)
+    api_get "$CTRL/proxies"
+    echo
+    ;;
+
+  groups)
+    fetch_proxies
+    python3 - <<'PY'
+import json
+proxies=json.load(open('/tmp/mihomo-proxies.json'))['proxies']
+for name,item in proxies.items():
+    if item.get('type') in ('Selector','URLTest','Fallback','LoadBalance'):
+        print(f"{name} [{item.get('type')}] 当前: {item.get('now')}")
+PY
+    ;;
+
+  current)
+    fetch_proxies
+    python3 - <<'PY'
+import json
+proxies=json.load(open('/tmp/mihomo-proxies.json'))['proxies']
+for name,item in proxies.items():
+    if item.get('type') in ('Selector','URLTest','Fallback','LoadBalance'):
+        print(f"{name} => {item.get('now')}")
+PY
+    ;;
+
+  nodes)
+    group="${2:-}"
+    if [ -z "$group" ]; then
+      echo "Usage: mc nodes '<代理组名>'" >&2
+      exit 1
+    fi
+    fetch_proxies
+    GROUP_NAME="$group" python3 - <<'PY'
+import os,json,sys
+proxies=json.load(open('/tmp/mihomo-proxies.json'))['proxies']
+group=os.environ['GROUP_NAME']
+if group not in proxies:
+    print(f"找不到代理组: {group}", file=sys.stderr)
+    print("可用代理组：", file=sys.stderr)
+    for name,item in proxies.items():
+        if item.get('type') in ('Selector','URLTest','Fallback','LoadBalance'):
+            print(f"  {name}", file=sys.stderr)
+    sys.exit(1)
+item=proxies[group]
+print(f"{group} [{item.get('type')}] 当前: {item.get('now')}")
+for n in item.get('all', []):
+    print(n)
+PY
+    ;;
+
+  switch)
+    group="${2:-}"
+    node="${3:-}"
+    if [ -z "$group" ] || [ -z "$node" ]; then
+      echo "Usage: mc switch '<代理组名>' '<节点名>'" >&2
+      exit 1
+    fi
+    GROUP="$group" GROUP_URL=$(GROUP="$group" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["GROUP"], safe=""))')
+    BODY=$(json_body_for_node "$node")
+    api_put_json "$CTRL/proxies/$GROUP_URL" "$BODY" >/tmp/mihomo-switch.out || {
+      cat /tmp/mihomo-switch.out >&2 || true
+      exit 1
+    }
+    if [ -s /tmp/mihomo-switch.out ]; then
+      cat /tmp/mihomo-switch.out
+      echo
+    fi
+    echo "已切换：$group => $node"
+    ;;
+
+  delay)
+    node="${2:-}"
+    timeout="${3:-5000}"
+    if [ -z "$node" ]; then
+      echo "Usage: mc delay '<节点名>' [timeout_ms]" >&2
+      exit 1
+    fi
+    NODE="$node" NODE_URL=$(NODE="$node" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["NODE"], safe=""))')
+    api_get "$CTRL/proxies/$NODE_URL/delay?url=http://www.gstatic.com/generate_204&timeout=$timeout"
+    echo
+    ;;
+
+  test)
+    proxy="${2:-http://127.0.0.1:7890}"
+    echo "Testing via $proxy ..." >&2
+    curl -x "$proxy" -L --connect-timeout 10 --max-time 30 https://ipinfo.io
+    echo
+    ;;
+
+  reload)
+    # mihomo reload API accepts PUT /configs with optional path payload.
+    api_put_json "$CTRL/configs?force=true" '{}' >/tmp/mihomo-reload.out || {
+      cat /tmp/mihomo-reload.out >&2 || true
+      exit 1
+    }
+    if [ -s /tmp/mihomo-reload.out ]; then
+      cat /tmp/mihomo-reload.out
+      echo
+    fi
+    echo "已请求重新加载配置"
+    ;;
+
+  help|-h|--help)
+    usage
+    ;;
+
+  *)
+    echo "未知命令: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac
