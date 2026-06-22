@@ -26,12 +26,20 @@ mihomo (Clash Meta) 代理快捷命令集 + CLI 工具包。
 
 ## 安装
 
+一键安装，无需预先安装 mihomo：
+
 ```bash
 git clone https://github.com/Sky2Shaw/proxy-helper.git
 cd proxy-helper
 bash install.sh
 source ~/.bashrc
 ```
+
+`install.sh` 会自动：
+1. **下载 mihomo** — 从 GitHub Releases 获取最新版，安装到 `/usr/local/bin/mihomo`（如已安装则跳过）
+2. **创建配置目录** — `/etc/mihomo/` + 最小可用配置（如已存在则跳过）
+3. **安装工具** — `mc`、`mihomo-bg` → `~/.local/bin/`，`proxy.sh` → `~/.local/lib/`
+4. **配置 bashrc** — 自动 source 函数库、添加 PATH
 
 ## 使用方法
 
@@ -174,8 +182,11 @@ proxy-helper/
 
 ## 前置要求
 
-- mihomo v1.19+ 已安装在 `/usr/local/bin/mihomo`
-- 配置文件位于 `/etc/mihomo/config.yaml`
+install.sh 会自动安装 mihomo，无需手动操作。
+
+如果需要手动确认环境：
+- mihomo v1.19+ — install.sh 自动下载，或手动：`curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep browser_download_url`
+- 配置文件 — install.sh 自动创建最小配置，或手动放到 `/etc/mihomo/config.yaml`
 - python3 + PyYAML（用于 YAML 验证和订阅格式转换）
 - curl、sudo
 
